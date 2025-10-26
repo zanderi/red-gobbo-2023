@@ -100,6 +100,11 @@ static const unsigned long UNUSED_TS = 0xFFFFFFFFUL;
 static unsigned long christmasNextStartAt = 0;
 static int christmasNextIndex = 0;
 
+// Group fade defaults used by fadeLights/groupFade
+const unsigned long GROUP_FADE_MS = 700; // fade in/out for group fades
+const unsigned long GROUP_HOLD_MS = 700; // hold time at peak
+const unsigned long GROUP_GAP_MS  = 250; // gap between group A finishing and group B starting
+
 // brightness helper used by updateChristmas()
 static inline uint8_t christmasBrightnessForElapsed(unsigned long elapsed) {
   if (elapsed >= CHRISTMAS_TOTAL_MS) return 0;
@@ -119,7 +124,8 @@ static inline void writeChristmasBrightness(uint8_t idx, uint8_t val) {
 
 // prototype for the new strands functions
 void fadeLights();
-void twinkleLights(uint8_t nextDuty[6], const int groupIdx[3], unsigned long baseStart, bool invert);
+void groupFade(uint8_t nextDuty[6], const int groupIdx[3], unsigned long baseStart, unsigned long phaseOffsetMs);
+void twinkleLights();
 
 // Non-blocking update: handle active fades and schedule next LED starts
 void updateChristmas() {
@@ -355,7 +361,7 @@ void loop() {
 
   // run all three effects concurrently
   // replaced updateChristmas() with fadeLights() per user request
-  fadeLights();
+  twinkleLights();
   updateFire();
   updateFuse();
   // PWM now driven in ISR; nothing to call here
@@ -370,21 +376,21 @@ void loop() {
   yield();
 }
 
-// New function: fadeLights (renamed from toggleStrands)
-// Uses twinkleLights() to make two groups twinkle in alternate phase
-void twinkleLights(uint8_t nextDuty[6], const int groupIdx[3], unsigned long baseStart, bool invert) {
-  const unsigned long FADE_MS = 300;
-  const unsigned long HOLD_MS = 300;
-  const unsigned long TOTAL_MS = FADE_MS + HOLD_MS + FADE_MS; // 900
+// New helper: groupFade
+// Used by fadeLights(): fades a group of three indices together; 'invert' offsets phase by half cycle
+void groupFade(uint8_t nextDuty[6], const int groupIdx[3], unsigned long baseStart, unsigned long phaseOffsetMs) {
+  // use global GROUP_FADE_MS / GROUP_HOLD_MS and GROUP_GAP_MS
+  const unsigned long FADE_MS = GROUP_FADE_MS;
+  const unsigned long HOLD_MS = GROUP_HOLD_MS;
+  const unsigned long TOTAL_MS = FADE_MS + HOLD_MS + FADE_MS;
 
   unsigned long now = millis();
   unsigned long elapsed = (now >= baseStart) ? (now - baseStart) : 0;
-  if (invert) {
-    // shift by half period to invert phase
-    elapsed = (elapsed + (TOTAL_MS / 2)) % TOTAL_MS;
-  } else {
-    elapsed = elapsed % TOTAL_MS;
-  }
+  unsigned long period = (TOTAL_MS + GROUP_GAP_MS) * 2; // full A+gap+B+gap sequence
+  // apply phase offset and wrap into period
+  elapsed = (elapsed + phaseOffsetMs) % period;
+  // if we're outside the active TOTAL_MS window, leave outputs off
+  if (elapsed >= TOTAL_MS) return;
 
   uint8_t bri;
   if (elapsed < FADE_MS) {
@@ -406,7 +412,6 @@ void fadeLights() {
   // group indices
   const int A_idx[3] = {0,2,4}; // pins 5,7,4
   const int B_idx[3] = {1,3,5}; // pins 6,9,3
-
   unsigned long now = millis();
   static unsigned long baseStart = 0;
   if (baseStart == 0) baseStart = now;
@@ -414,12 +419,99 @@ void fadeLights() {
   uint8_t nextDuty[6];
   for (int i = 0; i < 6; ++i) nextDuty[i] = 0;
 
-  // group A normal phase
-  twinkleLights(nextDuty, A_idx, baseStart, false);
-  // group B inverted phase so they alternate
-  twinkleLights(nextDuty, B_idx, baseStart, true);
+  const unsigned long FADE_MS = GROUP_FADE_MS;
+  const unsigned long HOLD_MS = GROUP_HOLD_MS;
+  const unsigned long TOTAL_MS = FADE_MS + HOLD_MS + FADE_MS;
+  const unsigned long GAP_MS = GROUP_GAP_MS;
+  const unsigned long CYCLE = (TOTAL_MS + GAP_MS) * 2; // A + gap + B + gap
+
+  unsigned long t = (now - baseStart) % CYCLE;
+
+  if (t < TOTAL_MS) {
+    // A active
+    unsigned long e = t; // 0..TOTAL_MS
+    uint8_t bri;
+    if (e < FADE_MS) bri = (uint8_t)((e * 255UL) / FADE_MS);
+    else if (e < FADE_MS + HOLD_MS) bri = 255;
+    else bri = (uint8_t)(((FADE_MS - (e - (FADE_MS + HOLD_MS))) * 255UL) / FADE_MS);
+    if (bri < 6) bri = 0;
+    uint8_t scaled = (uint8_t)((((unsigned int)bri) * (unsigned int)CHRISTMAS_PWM_RES) / 256U);
+    for (int i = 0; i < 3; ++i) nextDuty[A_idx[i]] = scaled;
+    // ensure B is off
+    for (int i = 0; i < 3; ++i) nextDuty[B_idx[i]] = 0;
+  } else if (t < TOTAL_MS + GAP_MS) {
+    // gap after A: all off
+    // nextDuty already zeroed
+  } else if (t < TOTAL_MS + GAP_MS + TOTAL_MS) {
+    // B active
+    unsigned long e = t - (TOTAL_MS + GAP_MS);
+    uint8_t bri;
+    if (e < FADE_MS) bri = (uint8_t)((e * 255UL) / FADE_MS);
+    else if (e < FADE_MS + HOLD_MS) bri = 255;
+    else bri = (uint8_t)(((FADE_MS - (e - (FADE_MS + HOLD_MS))) * 255UL) / FADE_MS);
+    if (bri < 6) bri = 0;
+    uint8_t scaled = (uint8_t)((((unsigned int)bri) * (unsigned int)CHRISTMAS_PWM_RES) / 256U);
+    for (int i = 0; i < 3; ++i) nextDuty[B_idx[i]] = scaled;
+    // ensure A is off
+    for (int i = 0; i < 3; ++i) nextDuty[A_idx[i]] = 0;
+  } else {
+    // gap after B: all off
+  }
 
   // atomically copy
+  noInterrupts();
+  for (int i = 0; i < 6; ++i) christmasDuty[i] = nextDuty[i];
+  interrupts();
+}
+
+// New top-level twinkleLights: random short twinkles across all 6 LEDs.
+// Non-blocking: call from loop() when you want the twinkle effect active.
+void twinkleLights() {
+  // slower, less-frequent twinkles
+  const unsigned long MIN_DUR = 300;   // min twinkle duration ms (was 120)
+  const unsigned long MAX_DUR = 1200;  // max twinkle duration ms (was 600)
+  const int START_CHANCE = 6; // percent chance per call per inactive LED to start (was 10)
+
+  static unsigned long startTimes[6] = {0,0,0,0,0,0};
+  static unsigned long durations[6]  = {0,0,0,0,0,0};
+
+  unsigned long now = millis();
+  uint8_t nextDuty[6];
+  for (int i = 0; i < 6; ++i) nextDuty[i] = 0;
+
+  for (int i = 0; i < 6; ++i) {
+    if (startTimes[i] == 0) {
+      // inactive; small random chance to start a twinkle
+      if (random(0,100) < START_CHANCE) {
+        startTimes[i] = now;
+        durations[i] = rndRange(MIN_DUR, MAX_DUR);
+      }
+    }
+    if (startTimes[i] != 0) {
+      unsigned long elapsed = now - startTimes[i];
+      if (elapsed >= durations[i]) {
+        // finished
+        startTimes[i] = 0;
+        durations[i] = 0;
+        nextDuty[i] = 0;
+      } else {
+        // triangular profile (fade in then fade out)
+        unsigned long half = durations[i] / 2;
+        uint8_t bri;
+        if (elapsed < half) {
+          bri = (uint8_t)((elapsed * 255UL) / half);
+        } else {
+          unsigned long tout = elapsed - half;
+          bri = (uint8_t)(((half - tout) * 255UL) / half);
+        }
+        if (bri < 6) bri = 0;
+        uint8_t scaled = (uint8_t)((((unsigned int)bri) * (unsigned int)CHRISTMAS_PWM_RES) / 256U);
+        nextDuty[i] = scaled;
+      }
+    }
+  }
+
+  // copy into volatile duty array atomically
   noInterrupts();
   for (int i = 0; i < 6; ++i) christmasDuty[i] = nextDuty[i];
   interrupts();
