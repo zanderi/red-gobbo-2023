@@ -117,6 +117,10 @@ static inline void writeChristmasBrightness(uint8_t idx, uint8_t val) {
   writeChristmasBrightnessRaw(idx, val);
 }
 
+// prototype for the new strands functions
+void fadeLights();
+void twinkleLights(uint8_t nextDuty[6], const int groupIdx[3], unsigned long baseStart, bool invert);
+
 // Non-blocking update: handle active fades and schedule next LED starts
 void updateChristmas() {
   unsigned long now = millis();
@@ -264,7 +268,7 @@ void led_test() {
 void setup() {
   delay(1500);                 // allow USB to enumerate
   Serial.begin(115200);
-  led_test();
+  // led_test();
   
   Serial.println("LED effects starting...");
 
@@ -350,7 +354,8 @@ void loop() {
   } */
 
   // run all three effects concurrently
-  updateChristmas();
+  // replaced updateChristmas() with fadeLights() per user request
+  fadeLights();
   updateFire();
   updateFuse();
   // PWM now driven in ISR; nothing to call here
@@ -363,4 +368,59 @@ void loop() {
 
   // yield instead of delay to keep PWM updates responsive
   yield();
+}
+
+// New function: fadeLights (renamed from toggleStrands)
+// Uses twinkleLights() to make two groups twinkle in alternate phase
+void twinkleLights(uint8_t nextDuty[6], const int groupIdx[3], unsigned long baseStart, bool invert) {
+  const unsigned long FADE_MS = 300;
+  const unsigned long HOLD_MS = 300;
+  const unsigned long TOTAL_MS = FADE_MS + HOLD_MS + FADE_MS; // 900
+
+  unsigned long now = millis();
+  unsigned long elapsed = (now >= baseStart) ? (now - baseStart) : 0;
+  if (invert) {
+    // shift by half period to invert phase
+    elapsed = (elapsed + (TOTAL_MS / 2)) % TOTAL_MS;
+  } else {
+    elapsed = elapsed % TOTAL_MS;
+  }
+
+  uint8_t bri;
+  if (elapsed < FADE_MS) {
+    bri = (uint8_t)((elapsed * 255UL) / FADE_MS);
+  } else if (elapsed < (FADE_MS + HOLD_MS)) {
+    bri = 255;
+  } else {
+    unsigned long tout = elapsed - (FADE_MS + HOLD_MS);
+    bri = (uint8_t)(((FADE_MS - tout) * 255UL) / FADE_MS);
+  }
+  if (bri < 6) bri = 0;
+  uint8_t scaled = (uint8_t)((((unsigned int)bri) * (unsigned int)CHRISTMAS_PWM_RES) / 256U);
+  for (int i = 0; i < 3; ++i) {
+    nextDuty[groupIdx[i]] = scaled;
+  }
+}
+
+void fadeLights() {
+  // group indices
+  const int A_idx[3] = {0,2,4}; // pins 5,7,4
+  const int B_idx[3] = {1,3,5}; // pins 6,9,3
+
+  unsigned long now = millis();
+  static unsigned long baseStart = 0;
+  if (baseStart == 0) baseStart = now;
+
+  uint8_t nextDuty[6];
+  for (int i = 0; i < 6; ++i) nextDuty[i] = 0;
+
+  // group A normal phase
+  twinkleLights(nextDuty, A_idx, baseStart, false);
+  // group B inverted phase so they alternate
+  twinkleLights(nextDuty, B_idx, baseStart, true);
+
+  // atomically copy
+  noInterrupts();
+  for (int i = 0; i < 6; ++i) christmasDuty[i] = nextDuty[i];
+  interrupts();
 }
