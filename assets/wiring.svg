@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="360" viewBox="0 0 800 360">
+  <style>
+    .box { fill:#f7f7f7; stroke:#333; stroke-width:1.5 }
+    .txt { font-family: Arial, Helvetica, sans-serif; font-size:14px; fill:#111 }
+    .small { font-size:12px }
+    .arrow { stroke:#333; stroke-width:1.6; fill:none; marker-end:url(#arrowhead) }
+  </style>
+  <defs>
+    <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="10" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#333" />
+    </marker>
+  </defs>
+
+  <!-- ESP block -->
+  <rect x="20" y="40" width="180" height="120" class="box"/>
+  <text x="30" y="60" class="txt">ESP32-C3</text>
+  <text x="30" y="82" class="small">GPIO5</text>
+  <text x="30" y="100" class="small">GPIO6</text>
+  <text x="30" y="118" class="small">GPIO7</text>
+  <text x="80" y="82" class="small">GPIO8</text>
+  <text x="80" y="100" class="small">GPIO9</text>
+  <text x="80" y="118" class="small">GPIO10</text>
+
+  <!-- ULN block -->
+  <rect x="300" y="20" width="200" height="200" class="box"/>
+  <text x="320" y="40" class="txt">ULN2803</text>
+  <text x="320" y="64" class="small">IN1..IN6</text>
+  <text x="320" y="84" class="small">OUT1..OUT6</text>
+  <text x="320" y="104" class="small">GND -> common</text>
+
+  <!-- LEDs block -->
+  <rect x="560" y="20" width="200" height="200" class="box"/>
+  <text x="580" y="40" class="txt">LEDs</text>
+  <text x="580" y="64" class="small">LED1..LED6 (anode -> resistor -> +V)</text>
+
+  <!-- Arrows ESP -> ULN -->
+  <path class="arrow" d="M200 82 L300 82"/>
+  <path class="arrow" d="M200 100 L300 100"/>
+  <path class="arrow" d="M200 118 L300 118"/>
+  <path class="arrow" d="M260 82 L300 82"/>
+  <path class="arrow" d="M260 100 L300 100"/>
+  <path class="arrow" d="M260 118 L300 118"/>
+
+  <!-- Arrows ULN -> LEDs -->
+  <path class="arrow" d="M500 64 L560 64"/>
+  <path class="arrow" d="M500 84 L560 84"/>
+  <path class="arrow" d="M500 104 L560 104"/>
+
+  <!-- FIRE/FUSE -->
+  <rect x="20" y="200" width="140" height="80" class="box"/>
+  <text x="30" y="220" class="txt">FIRE / FUSE</text>
+  <text x="30" y="240" class="small">GPIO1 (FIRE), GPIO2 (FUSE)</text>
+  <path class="arrow" d="M160 240 L300 240"/>
+  <text x="310" y="235" class="small">(optional separate LEDs)</text>
+
+  <!-- footer note -->
+  <text x="20" y="320" class="small">Note: ULN is a low-side sink. Tie ULN GND to ESP GND. LED anodes -> resistor -> +V.</text>
+</svg>

@@ -1,0 +1,66 @@
+LightEffects library
+
+Purpose
+-------
+Small, self-contained library that implements the Christmas-strand lighting effects used in this project. It runs the three modes (chain, twinkle, group fade) using a non-blocking sequencer and an ISR-driven software PWM for the 6 ULN2803-driven outputs.
+
+Pin order
+---------
+The constructor expects a 6-element array of GPIO numbers for the ULN2803 inputs in this order (index 0..5):
+- index 0 -> first LED (A group)
+- index 1 -> second LED (B group)
+- index 2 -> third LED (A group)
+- index 3 -> fourth LED (B group)
+- index 4 -> fifth LED (A group)
+- index 5 -> sixth LED (B group)
+
+Public API
+----------
+- LightEffects(const int pins[6])
+  - Construct with a 6-element array of GPIO pin numbers. Does not start timers or change pin modes.
+
+- void begin()
+  - Call from `setup()` to configure pins, initialize state and start the ISR-driven software PWM timer.
+
+- void tick()
+  - Non-blocking work; call frequently from `loop()` to run the sequencer and effects.
+
+- void setModeDuration(unsigned long ms)
+  - Optional: override the default duration (15s) for each Christmas mode.
+
+Example usage
+-------------
+In `src/main.cpp`:
+
+```cpp
+#include "LightEffects.h"
+
+const int CHRISTMAS_PINS[6] = {5,6,7,8,9,10};
+LightEffects lights(CHRISTMAS_PINS);
+
+void setup() {
+  Serial.begin(115200);
+  lights.begin();
+  // optionally change per-mode duration
+  // lights.setModeDuration(20000); // 20 seconds
+}
+
+void loop() {
+  lights.tick();
+  // other non-blocking tasks (e.g., FIRE/FUSE LED updates)
+}
+```
+
+Notes and implementation details
+--------------------------------
+- The 6 Christmas outputs use an ISR-driven software PWM at 64 steps to avoid using all LEDC channels. The library uses `timerBegin`/`timerAttachInterrupt` and `gpio_set_level`, so it is specific to Espressif MCU platforms (ESP32 family).
+- FIRE and FUSE LEDs are intentionally kept in `src/main.cpp` and driven with LEDC hardware PWM for smoother flicker and lower CPU load.
+- Twinkle behavior is tuned to cap active twinkles at 3 and evaluate new twinkles on a randomized interval (250–400 ms) to produce organic-looking starts.
+- Mode transitions fade to a small baseline, hold briefly, then fully turn off before switching modes to avoid visual blips.
+
+Thread-safety
+-------------
+- `tick()` is safe to call from the main loop. The ISR updates physical pins; the library performs atomic duty-table updates with interrupts disabled briefly.
+- Do not call `begin()` from an ISR; call it from setup or the main context.
+
+If you want, I can add more examples (runtime serial commands to change mode or force a specific mode) or small unit tests to validate timing behavior off-hardware.
