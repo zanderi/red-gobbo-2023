@@ -2,7 +2,7 @@
 #include "driver/gpio.h"   // for gpio_set_level
 
 // Christmas LEDs: each LED cathode -> its own ULN2803 OUTx, ULN INs driven by these GPIOs
-const int CHRISTMAS_PINS[6] = {5, 6, 7, 9, 4, 3}; // <-- updated per your wiring
+const int CHRISTMAS_PINS[6] = {5, 6, 7, 8, 9, 10}; // <-- updated per your wiring
 #define FIRE_PIN 1           // fireplace LED (PWM)
 #define FUSE_PIN 2           // fuse LED (PWM)
 
@@ -13,6 +13,16 @@ const int CHANNEL_FUSE = 1;
 const int CHANNEL_CHRISTMAS_BASE = 2; // channels 2..7
 const int PWM_FREQ = 5000;
 const int PWM_RES = 8; // 0..255
+
+// --- software PWM parameters for the Christmas strand (ISR-driven) ---
+// total PWM period in microseconds and resolution (number of steps)
+const unsigned long CHRISTMAS_PWM_US = 2000UL; // 2ms period (~500Hz)
+const int CHRISTMAS_PWM_RES = 64;             // 64-step resolution
+
+// ISR-driven duty table (0..CHRISTMAS_PWM_RES-1)
+volatile uint8_t christmasDuty[6] = {0,0,0,0,0,0};
+volatile int christmasPwmPhase = 0;
+hw_timer_t* christmasPwmTimer = NULL;
 
 // --- runtime state ---
 unsigned long nowMs = 0;
@@ -66,33 +76,14 @@ static inline uint8_t christmasMaskFor(int pos, bool phaseEven) {
   }
 }
 
-// Remove CHANNEL_CHRISTMAS_BASE usage (we'll use software PWM)
-#undef CHANNEL_CHRISTMAS_BASE
-
-// Software PWM settings for Christmas outputs (ISR-driven)
-// Choose a PWM period and resolution such that ISR rate is reasonable.
-// Period = CHRISTMAS_PWM_US microseconds, resolution = CHRISTMAS_PWM_RES steps.
-const unsigned long CHRISTMAS_PWM_US = 2000; // 2 ms period (~500 Hz)
-const uint8_t CHRISTMAS_PWM_RES = 64;       // 64-level resolution -> ISR ~ 32 kHz
-volatile uint8_t christmasDuty[6]; // 0..(CHRISTMAS_PWM_RES-1) target duty for each Christmas LED
-volatile uint8_t christmasPwmPhase = 0;
-hw_timer_t * christmasPwmTimer = NULL;
-// ISR prototype (defined later) - declare before use in setup
-void IRAM_ATTR onChristmasPwmTimer();
-
-// helper to write duty atomically (old writeChristmasBrightness replaced)
-static inline void writeChristmasBrightnessRaw(uint8_t idx, uint8_t val) {
-  christmasDuty[idx] = val;
-}
-
-// --- Add missing Christmas timing / state helpers (fixes undefined symbols) ---
+// Christmas timing/state helpers (needed by the brightness scheduler)
 const unsigned long CHRISTMAS_FADE_MS    = 300;
 const unsigned long CHRISTMAS_HOLD_MS    = 300;
 const unsigned long CHRISTMAS_OVERLAP_MS = 100;
-const unsigned long CHRISTMAS_TOTAL_MS   = (CHRISTMAS_FADE_MS + CHRISTMAS_HOLD_MS + CHRISTMAS_FADE_MS); // 900
-const unsigned long CHRISTMAS_STEP_MS    = (CHRISTMAS_TOTAL_MS - CHRISTMAS_OVERLAP_MS); // 800
+const unsigned long CHRISTMAS_TOTAL_MS   = (CHRISTMAS_FADE_MS + CHRISTMAS_HOLD_MS + CHRISTMAS_FADE_MS);
+const unsigned long CHRISTMAS_STEP_MS    = (CHRISTMAS_TOTAL_MS - CHRISTMAS_OVERLAP_MS);
 
-const unsigned long CHRISTMAS_COOLDOWN_MS = 80; // used to avoid immediate reuse of a slot
+const unsigned long CHRISTMAS_COOLDOWN_MS = 80; // ms cooldown to avoid immediate reuse
 static unsigned long christmasStartTimes[6];
 static unsigned long christmasCooldown[6];
 static const unsigned long UNUSED_TS = 0xFFFFFFFFUL;
@@ -100,12 +91,36 @@ static const unsigned long UNUSED_TS = 0xFFFFFFFFUL;
 static unsigned long christmasNextStartAt = 0;
 static int christmasNextIndex = 0;
 
-// Group fade defaults used by fadeLights/groupFade
-const unsigned long GROUP_FADE_MS = 700; // fade in/out for group fades
-const unsigned long GROUP_HOLD_MS = 700; // hold time at peak
-const unsigned long GROUP_GAP_MS  = 250; // gap between group A finishing and group B starting
+// Sequence manager state: run chain, twinkle, fade in sequence
+enum SequenceMode { MODE_CHAIN = 0, MODE_TWINKLE = 1, MODE_FADE = 2 };
+SequenceMode currentMode = MODE_CHAIN;
+unsigned long modeStartMs = 0;
+const unsigned long MODE_DURATION_MS = 15000UL; // 15 seconds per mode
+bool modeInTransition = false;
+unsigned long modeTransitionStart = 0;
+const unsigned long TRANSITION_FADE_MS = 800UL; // fade-to-off duration between modes
+// Instead of forcing absolute zero (which can show as brief ON due to PWM/resolution),
+// fade to a small baseline brightness and hold, then clear to zero. This reduces
+// visible blips on some hardware/ULN2803 combinations.
+const uint8_t TRANSITION_BASELINE_BRI = 6; // 0..255 baseline while settling (approx 2%)
+const unsigned long TRANSITION_HOLD_MS = 200UL; // hold baseline before final zero
 
-// brightness helper used by updateChristmas()
+// Twinkle state moved to file-scope so we can reset when switching modes
+static bool twinkle_active[6] = {false,false,false,false,false,false};
+static unsigned long twinkle_startTs[6] = {0,0,0,0,0,0};
+static unsigned long twinkle_durMs[6] = {0,0,0,0,0,0};
+static unsigned long twinkle_nextEvalAt = 0;
+
+// Fade helper baseStart moved to file-scope so we can reset it when entering fade mode
+static unsigned long fadeBaseStart = 0;
+
+// Group fade parameters (used by fadeLights / groupFade)
+// per user request, slow fade timing to ~300ms
+const unsigned long GROUP_FADE_MS = 250;
+const unsigned long GROUP_HOLD_MS = 250;
+const unsigned long GROUP_GAP_MS  = 400;
+
+// brightness helper used by chainChristmasLights()
 static inline uint8_t christmasBrightnessForElapsed(unsigned long elapsed) {
   if (elapsed >= CHRISTMAS_TOTAL_MS) return 0;
   if (elapsed < CHRISTMAS_FADE_MS) {
@@ -118,17 +133,35 @@ static inline uint8_t christmasBrightnessForElapsed(unsigned long elapsed) {
 }
 
 // wrapper to match calls in code (writeChristmasBrightness used throughout)
+// forward-declare low-level writer so wrapper can call it before its definition
+static inline void writeChristmasBrightnessRaw(uint8_t idx, uint8_t val);
 static inline void writeChristmasBrightness(uint8_t idx, uint8_t val) {
   writeChristmasBrightnessRaw(idx, val);
+}
+
+// low-level writer: scale 0..255 into 0..(CHRISTMAS_PWM_RES-1) and update atomically
+static inline void writeChristmasBrightnessRaw(uint8_t idx, uint8_t val) {
+  if (idx >= 6) return;
+  uint8_t scaled = (uint8_t)((((unsigned int)val) * (unsigned int)CHRISTMAS_PWM_RES) / 256U);
+  noInterrupts();
+  christmasDuty[idx] = scaled;
+  interrupts();
 }
 
 // prototype for the new strands functions
 void fadeLights();
 void groupFade(uint8_t nextDuty[6], const int groupIdx[3], unsigned long baseStart, unsigned long phaseOffsetMs);
 void twinkleLights();
+void runSequenceManager();
+void resetTwinkle();
+void resetChain();
+void resetFade();
+// forward declarations for ISR and low-level writer used before their definitions
+void IRAM_ATTR onChristmasPwmTimer();
+static inline void writeChristmasBrightnessRaw(uint8_t idx, uint8_t val);
 
 // Non-blocking update: handle active fades and schedule next LED starts
-void updateChristmas() {
+void chainChristmasLights() {
   unsigned long now = millis();
 
   // prepare shadow duties to compute all updates without partially updating the active table
@@ -359,9 +392,8 @@ void loop() {
     digitalWrite(LED_BUILTIN, statusOn ? HIGH : LOW);
   } */
 
-  // run all three effects concurrently
-  // replaced updateChristmas() with fadeLights() per user request
-  twinkleLights();
+  // run sequence manager which runs chain / twinkle / fade in order
+  runSequenceManager();
   updateFire();
   updateFuse();
   // PWM now driven in ISR; nothing to call here
@@ -413,8 +445,7 @@ void fadeLights() {
   const int A_idx[3] = {0,2,4}; // pins 5,7,4
   const int B_idx[3] = {1,3,5}; // pins 6,9,3
   unsigned long now = millis();
-  static unsigned long baseStart = 0;
-  if (baseStart == 0) baseStart = now;
+  if (fadeBaseStart == 0) fadeBaseStart = now;
 
   uint8_t nextDuty[6];
   for (int i = 0; i < 6; ++i) nextDuty[i] = 0;
@@ -425,7 +456,7 @@ void fadeLights() {
   const unsigned long GAP_MS = GROUP_GAP_MS;
   const unsigned long CYCLE = (TOTAL_MS + GAP_MS) * 2; // A + gap + B + gap
 
-  unsigned long t = (now - baseStart) % CYCLE;
+  unsigned long t = (now - fadeBaseStart) % CYCLE;
 
   if (t < TOTAL_MS) {
     // A active
@@ -466,53 +497,186 @@ void fadeLights() {
 
 // New top-level twinkleLights: random short twinkles across all 6 LEDs.
 // Non-blocking: call from loop() when you want the twinkle effect active.
-void twinkleLights() {
-  // slower, less-frequent twinkles
-  const unsigned long MIN_DUR = 300;   // min twinkle duration ms (was 120)
-  const unsigned long MAX_DUR = 1200;  // max twinkle duration ms (was 600)
-  const int START_CHANCE = 6; // percent chance per call per inactive LED to start (was 10)
+// reset twinkle state (call when entering twinkle mode)
+void resetTwinkle() {
+  for (int i = 0; i < 6; ++i) {
+    twinkle_active[i] = false;
+    twinkle_startTs[i] = 0;
+    twinkle_durMs[i] = 0;
+  }
+  twinkle_nextEvalAt = 0;
+}
 
-  static unsigned long startTimes[6] = {0,0,0,0,0,0};
-  static unsigned long durations[6]  = {0,0,0,0,0,0};
+// Twinkle lights: uses file-scope twinkle_* state so it can be reset on mode changes
+void twinkleLights() {
+  // Tunable: faster, independent twinkles
+  const unsigned long MIN_DUR_MS = 120;   // minimum twinkle length (ms)
+  const unsigned long MAX_DUR_MS = 800;   // maximum twinkle length (ms)
+  const uint8_t START_CHANCE = 14;        // percent chance to start per check per LED
+  // We'll randomize the delay between start-evaluations to 250..400ms per user request
 
   unsigned long now = millis();
+  // If this is the first call after a reset, schedule the first evaluation and return
+  // so we don't immediately start a burst of twinkles. Keeps strand LOW initially.
+  if (twinkle_nextEvalAt == 0) {
+    twinkle_nextEvalAt = now + rndRange(250, 400);
+    return;
+  }
+  if (now < twinkle_nextEvalAt) return; // wait until randomized next evaluation time
+  // schedule next evaluation randomly between 250 and 400 ms
+  twinkle_nextEvalAt = now + rndRange(250, 400);
+
+  // compute next duty table in the resolution the ISR expects (0..CHRISTMAS_PWM_RES-1)
   uint8_t nextDuty[6];
   for (int i = 0; i < 6; ++i) nextDuty[i] = 0;
 
+  // First, clear finished twinkles and count active ones
+  int activeCount = 0;
   for (int i = 0; i < 6; ++i) {
-    if (startTimes[i] == 0) {
-      // inactive; small random chance to start a twinkle
-      if (random(0,100) < START_CHANCE) {
-        startTimes[i] = now;
-        durations[i] = rndRange(MIN_DUR, MAX_DUR);
-      }
-    }
-    if (startTimes[i] != 0) {
-      unsigned long elapsed = now - startTimes[i];
-      if (elapsed >= durations[i]) {
-        // finished
-        startTimes[i] = 0;
-        durations[i] = 0;
-        nextDuty[i] = 0;
+    if (twinkle_active[i]) {
+      unsigned long elapsed = now - twinkle_startTs[i];
+      if (elapsed >= twinkle_durMs[i]) {
+        twinkle_active[i] = false;
       } else {
-        // triangular profile (fade in then fade out)
-        unsigned long half = durations[i] / 2;
-        uint8_t bri;
-        if (elapsed < half) {
-          bri = (uint8_t)((elapsed * 255UL) / half);
-        } else {
-          unsigned long tout = elapsed - half;
-          bri = (uint8_t)(((half - tout) * 255UL) / half);
-        }
-        if (bri < 6) bri = 0;
-        uint8_t scaled = (uint8_t)((((unsigned int)bri) * (unsigned int)CHRISTMAS_PWM_RES) / 256U);
-        nextDuty[i] = scaled;
+        activeCount++;
       }
     }
   }
 
-  // copy into volatile duty array atomically
+  // Then evaluate potential starts and compute envelopes
+  for (int i = 0; i < 6; ++i) {
+    // If LED is inactive, we may start it only if we haven't hit the cap
+    if (!twinkle_active[i]) {
+      if (activeCount < 3 && (random(0, 100) < START_CHANCE)) {
+        twinkle_active[i] = true;
+        twinkle_startTs[i] = now;
+        twinkle_durMs[i] = rndRange(MIN_DUR_MS, MAX_DUR_MS);
+        activeCount++;
+      }
+    } else {
+      // active: allow random restart even when active (doesn't increase activeCount)
+      if (random(0, 100) < START_CHANCE) {
+        twinkle_startTs[i] = now;
+        twinkle_durMs[i] = rndRange(MIN_DUR_MS, MAX_DUR_MS);
+      }
+    }
+
+    if (twinkle_active[i]) {
+      unsigned long elapsed = now - twinkle_startTs[i];
+      if (elapsed >= twinkle_durMs[i]) {
+        // finished twinkle
+        twinkle_active[i] = false;
+        nextDuty[i] = 0;
+        continue;
+      }
+      // triangular envelope: up then down
+  float progress = (float)elapsed / (float)twinkle_durMs[i]; // 0..1
+      float tri;
+      if (progress < 0.5f) tri = (progress / 0.5f);      // 0..1 up
+      else tri = (1.0f - (progress - 0.5f) / 0.5f);      // 1..0 down
+      int bri = (int)(tri * 255.0f + 0.5f);
+      if (bri < 8) bri = 0; // cutoff to avoid micro-blips
+      // scale to pwm resolution
+      uint8_t scaled = (uint8_t)((((unsigned int)constrain(bri,0,255)) * (unsigned int)CHRISTMAS_PWM_RES) / 256U);
+      nextDuty[i] = scaled;
+    } else {
+      nextDuty[i] = 0;
+    }
+  }
+
+  // atomic update of the ISR duty table
   noInterrupts();
   for (int i = 0; i < 6; ++i) christmasDuty[i] = nextDuty[i];
   interrupts();
+}
+
+// Reset chain state (prepare for chain mode)
+void resetChain() {
+  unsigned long now = millis();
+  for (int i = 0; i < 6; ++i) {
+    christmasStartTimes[i] = UNUSED_TS;
+    christmasCooldown[i] = 0;
+  }
+  // start the scheduler immediately with the first slot
+  christmasStartTimes[0] = now;
+  christmasNextIndex = 1 % 6;
+  christmasNextStartAt = now + CHRISTMAS_STEP_MS;
+}
+
+// Reset fade mode state
+void resetFade() {
+  fadeBaseStart = 0; // will be set on first call to fadeLights()
+}
+
+// Sequence manager: call from loop() to run current mode and handle transitions
+void runSequenceManager() {
+  unsigned long now = millis();
+
+  if (!modeInTransition) {
+    // start the mode if not already started
+    if (modeStartMs == 0) {
+      modeStartMs = now;
+      // reset mode-specific state
+      if (currentMode == MODE_TWINKLE) resetTwinkle();
+      else if (currentMode == MODE_CHAIN) resetChain();
+      else if (currentMode == MODE_FADE) resetFade();
+    }
+
+    // run the active mode
+    if (currentMode == MODE_CHAIN) {
+      chainChristmasLights();
+    } else if (currentMode == MODE_TWINKLE) {
+      twinkleLights();
+    } else if (currentMode == MODE_FADE) {
+      fadeLights();
+    }
+
+    // check for mode timeout
+    if ((now - modeStartMs) >= MODE_DURATION_MS) {
+      modeInTransition = true;
+      modeTransitionStart = now;
+    }
+  } else {
+    // fade all LEDs to off over TRANSITION_FADE_MS
+    unsigned long elapsed = now - modeTransitionStart;
+    float frac = (elapsed >= TRANSITION_FADE_MS) ? 0.0f : (1.0f - (float)elapsed / (float)TRANSITION_FADE_MS);
+    if (frac < 0.0f) frac = 0.0f;
+
+    // apply fade to all christmas outputs (read current ISR duty and scale down)
+    noInterrupts();
+    for (int i = 0; i < 6; ++i) {
+      uint8_t duty = christmasDuty[i];
+      // convert to 0..255
+      uint8_t bri255 = (uint8_t)(((unsigned int)duty * 255U) / (unsigned int)CHRISTMAS_PWM_RES);
+      uint8_t out = (uint8_t)((float)bri255 * frac + 0.5f);
+      // write scaled value (this will scale again inside writeChristmasBrightnessRaw)
+      christmasDuty[i] = (uint8_t)((((unsigned int)out) * (unsigned int)CHRISTMAS_PWM_RES) / 256U);
+    }
+    interrupts();
+
+    if (elapsed >= (TRANSITION_FADE_MS + TRANSITION_HOLD_MS)) {
+      // final clear to zero after baseline hold
+      noInterrupts();
+      for (int i = 0; i < 6; ++i) christmasDuty[i] = 0;
+      interrupts();
+
+      // advance to next mode
+      modeInTransition = false;
+      modeStartMs = 0;
+      // rotate mode
+      if (currentMode == MODE_CHAIN) currentMode = MODE_TWINKLE;
+      else if (currentMode == MODE_TWINKLE) currentMode = MODE_FADE;
+      else currentMode = MODE_CHAIN;
+    } else if (elapsed >= TRANSITION_FADE_MS) {
+      // we're in baseline hold window: set a small non-zero baseline brightness
+      float fracHold = 0.0f; // baseline fraction is fixed (we use TRANSITION_BASELINE_BRI)
+      noInterrupts();
+      for (int i = 0; i < 6; ++i) {
+        // convert baseline 0..255 to ISR resolution
+        uint8_t out = TRANSITION_BASELINE_BRI;
+        christmasDuty[i] = (uint8_t)((((unsigned int)out) * (unsigned int)CHRISTMAS_PWM_RES) / 256U);
+      }
+      interrupts();
+    }
+  }
 }
