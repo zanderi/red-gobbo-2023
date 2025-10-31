@@ -17,8 +17,9 @@ unsigned long nowMs = 0;
 
 // FIRE/FUSE state
 unsigned long fireNextUpdate = 0;
-const unsigned long FIRE_UPDATE_MIN = 20;
-const unsigned long FIRE_UPDATE_MAX = 60;
+// Slower update interval for fireplace flicker: increases time between brightness updates
+const unsigned long FIRE_UPDATE_MIN = 40;   // previously 20 ms
+const unsigned long FIRE_UPDATE_MAX = 120;  // previously 60 ms
 float firePhase = 0.0f;
 
 unsigned long fuseNextUpdate = 0;
@@ -39,7 +40,8 @@ void updateFire() {
   int val = base + variance + sinv;
   val = constrain(val, 0, 255);
   ledcWrite(CHANNEL_FIRE, val);
-  firePhase += 0.12f + (random(0, 10) / 100.0f);
+  // advance the phase more slowly to reduce flicker frequency
+  firePhase += 0.06f + (random(0, 10) / 200.0f);
   if (firePhase > 10000.0f) firePhase = fmod(firePhase, 1000.0f);
   fireNextUpdate = nowMs + rndRange(FIRE_UPDATE_MIN, FIRE_UPDATE_MAX);
 }
