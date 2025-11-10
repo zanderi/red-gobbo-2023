@@ -2,6 +2,16 @@
 #include <Arduino.h>
 #include "driver/gpio.h"
 
+// Darlington transistor array inverts the signal
+// If USE_DARLINGTON is defined, we invert: HIGH->LOW, LOW->HIGH
+#ifdef USE_DARLINGTON
+  #define LED_ON  0
+  #define LED_OFF 1
+#else
+  #define LED_ON  1
+  #define LED_OFF 0
+#endif
+
 class LightEffects {
 public:
   LightEffects(const int pins[6]);
@@ -34,8 +44,11 @@ private:
   // fade base
   unsigned long fadeBaseStart;
 
+  // random light state (reuses christmasStartTimes/christmasCooldown arrays)
+  int randomLastIndex;
+  
   // sequence manager
-  enum SequenceMode { MODE_CHAIN = 0, MODE_TWINKLE = 1, MODE_FADE = 2 };
+  enum SequenceMode { MODE_CHAIN = 0, MODE_TWINKLE = 1, MODE_RANDOM = 2 };
   SequenceMode currentMode;
   unsigned long modeStartMs;
   unsigned long modeTransitionStart;
@@ -45,11 +58,13 @@ private:
   // internal helpers
   void chainChristmasLights();
   void twinkleLights();
+  void randomLights();
   void fadeLights();
   void groupFade(uint8_t nextDuty[6], const int groupIdx[3], unsigned long baseStart, unsigned long phaseOffsetMs);
   void runSequenceManager();
   void resetTwinkle();
   void resetChain();
+  void resetRandom();
   void resetFade();
 
   static LightEffects* instance; // for ISR callback

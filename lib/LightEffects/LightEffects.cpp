@@ -18,7 +18,7 @@ static unsigned long GROUP_HOLD_MS = 300;
 static unsigned long GROUP_GAP_MS  = 400;
 
 // sequence defaults
-static unsigned long MODE_DURATION_MS = 15000UL; // can be overridden with setModeDuration()
+static unsigned long MODE_DURATION_MS = 60000UL; // can be overridden with setModeDuration()
 static const unsigned long TRANSITION_FADE_MS = 800UL;
 static const uint8_t TRANSITION_BASELINE_BRI = 6;
 static const unsigned long TRANSITION_HOLD_MS = 200UL;
@@ -36,6 +36,7 @@ LightEffects::LightEffects(const int pins[6]) {
   christmasPwmPhase = 0;
   christmasNextIndex = 0;
   christmasNextStartAt = 0;
+  randomLastIndex = 0;
   fadeBaseStart = 0;
   currentMode = MODE_CHAIN;
   modeStartMs = 0;
@@ -66,7 +67,7 @@ void LightEffects::begin() {
   // configure pins as outputs and ensure off
   for (int i = 0; i < 6; ++i) {
     pinMode(_pins[i], OUTPUT);
-    gpio_set_level((gpio_num_t)_pins[i], 0);
+    gpio_set_level((gpio_num_t)_pins[i], LED_OFF);
     christmasDuty[i] = 0;
   }
 
@@ -100,7 +101,7 @@ void IRAM_ATTR LightEffects::onChristmasPwmTimer() {
   for (int i = 0; i < 6; ++i) {
     uint8_t duty = christmasDuty[i];
     bool on = (christmasPwmPhase < duty);
-    gpio_set_level((gpio_num_t)_pins[i], on ? 1 : 0);
+    gpio_set_level((gpio_num_t)_pins[i], on ? LED_ON : LED_OFF);
   }
 }
 
@@ -158,6 +159,71 @@ void LightEffects::chainChristmasLights() {
   interrupts();
 }
 
+void LightEffects::randomLights() {
+  unsigned long now = millis();
+  uint8_t nextDuty[6];
+  for (int i = 0; i < 6; ++i) nextDuty[i] = christmasDuty[i];
+
+  // Update currently active lights
+  for (int i = 0; i < 6; ++i) {
+    unsigned long ts = christmasStartTimes[i];
+    if (ts == UNUSED_TS) { nextDuty[i] = 0; continue; }
+    unsigned long elapsed = now - ts;
+    if (elapsed >= CHRISTMAS_TOTAL_MS) {
+      christmasStartTimes[i] = UNUSED_TS;
+      christmasCooldown[i] = now + CHRISTMAS_COOLDOWN_MS;
+      nextDuty[i] = 0;
+      continue;
+    }
+    uint8_t bri = christmasBrightnessForElapsed(elapsed);
+    if (bri < 6) bri = 0;
+    uint8_t scaled = scaleToIsr(bri);
+    nextDuty[i] = scaled;
+  }
+
+  // Start next random light (excluding sequential next)
+  if (now >= christmasNextStartAt) {
+    int attempts = 0;
+    int sequentialNext = (randomLastIndex + 1) % 6;
+    
+    while (attempts < 12) { // Try up to 12 times to find a valid light
+      int idx = random(0, 6);
+      
+      // Skip if it's the sequential next one
+      if (idx == sequentialNext) {
+        attempts++;
+        continue;
+      }
+      
+      // Check if this light is available
+      if (christmasStartTimes[idx] == UNUSED_TS && now >= christmasCooldown[idx]) {
+        christmasStartTimes[idx] = now;
+        randomLastIndex = idx;
+        christmasNextStartAt = now + CHRISTMAS_STEP_MS;
+        nextDuty[idx] = 1;
+        break;
+      }
+      attempts++;
+    }
+    if (attempts >= 12) christmasNextStartAt = now + 10;
+  }
+
+  noInterrupts();
+  for (int i = 0; i < 6; ++i) christmasDuty[i] = nextDuty[i];
+  interrupts();
+}
+
+void LightEffects::resetRandom() {
+  unsigned long now = millis();
+  for (int i = 0; i < 6; ++i) {
+    christmasStartTimes[i] = UNUSED_TS;
+    christmasCooldown[i] = 0;
+  }
+  randomLastIndex = random(0, 6);
+  christmasStartTimes[randomLastIndex] = now;
+  christmasNextStartAt = now + CHRISTMAS_STEP_MS;
+}
+
 void LightEffects::resetTwinkle() {
   for (int i = 0; i < 6; ++i) {
     twinkle_active[i] = false;
@@ -168,8 +234,11 @@ void LightEffects::resetTwinkle() {
 }
 
 void LightEffects::twinkleLights() {
-  const unsigned long MIN_DUR_MS = 120;
-  const unsigned long MAX_DUR_MS = 800;
+  // Match chain effect timing: 300ms fade in + 300ms hold + 300ms fade out = 900ms total
+  const unsigned long TWINKLE_DUR_MS = CHRISTMAS_TOTAL_MS; // 900ms to match chain effect
+  const unsigned long FADE_IN_MS = CHRISTMAS_FADE_MS;      // 300ms
+  const unsigned long HOLD_MS = CHRISTMAS_HOLD_MS;         // 300ms
+  const unsigned long FADE_OUT_MS = CHRISTMAS_FADE_MS;     // 300ms
   const uint8_t START_CHANCE = 14;
 
   unsigned long now = millis();
@@ -184,9 +253,18 @@ void LightEffects::twinkleLights() {
   for (int i = 0; i < 6; ++i) {
     if (twinkle_active[i]) {
       unsigned long elapsed = now - twinkle_startTs[i];
-      if (elapsed >= twinkle_durMs[i]) twinkle_active[i] = false;
+      if (elapsed >= TWINKLE_DUR_MS) twinkle_active[i] = false;
       else activeCount++;
     }
+  }
+
+  // Ensure at least one light is always active
+  if (activeCount == 0) {
+    int idx = random(0, 6);
+    twinkle_active[idx] = true;
+    twinkle_startTs[idx] = now;
+    twinkle_durMs[idx] = TWINKLE_DUR_MS;
+    activeCount = 1;
   }
 
   for (int i = 0; i < 6; ++i) {
@@ -194,24 +272,35 @@ void LightEffects::twinkleLights() {
       if (activeCount < 3 && (random(0,100) < START_CHANCE)) {
         twinkle_active[i] = true;
         twinkle_startTs[i] = now;
-        twinkle_durMs[i] = rndRange(MIN_DUR_MS, MAX_DUR_MS);
+        twinkle_durMs[i] = TWINKLE_DUR_MS;
         activeCount++;
       }
     } else {
       if (random(0,100) < START_CHANCE) {
         twinkle_startTs[i] = now;
-        twinkle_durMs[i] = rndRange(MIN_DUR_MS, MAX_DUR_MS);
+        twinkle_durMs[i] = TWINKLE_DUR_MS;
       }
     }
 
     if (twinkle_active[i]) {
       unsigned long elapsed = now - twinkle_startTs[i];
-      if (elapsed >= twinkle_durMs[i]) { twinkle_active[i] = false; nextDuty[i] = 0; continue; }
-      float progress = (float)elapsed / (float)twinkle_durMs[i];
-      float tri = (progress < 0.5f) ? (progress / 0.5f) : (1.0f - (progress - 0.5f) / 0.5f);
-      int bri = (int)(tri * 255.0f + 0.5f);
-      if (bri < 8) bri = 0;
-      uint8_t scaled = scaleToIsr((uint8_t)constrain(bri,0,255));
+      if (elapsed >= TWINKLE_DUR_MS) { twinkle_active[i] = false; nextDuty[i] = 0; continue; }
+      
+      // Match chain effect fade pattern: fade in -> hold -> fade out
+      uint8_t bri = 0;
+      if (elapsed < FADE_IN_MS) {
+        // Fade in phase
+        bri = (uint8_t)((elapsed * 255UL) / FADE_IN_MS);
+      } else if (elapsed < (FADE_IN_MS + HOLD_MS)) {
+        // Hold phase
+        bri = 255;
+      } else {
+        // Fade out phase
+        unsigned long fadeOutElapsed = elapsed - (FADE_IN_MS + HOLD_MS);
+        bri = (uint8_t)(255UL - ((fadeOutElapsed * 255UL) / FADE_OUT_MS));
+      }
+      
+      uint8_t scaled = scaleToIsr((uint8_t)constrain(bri, 0, 255));
       nextDuty[i] = scaled;
     } else {
       nextDuty[i] = 0;
@@ -305,11 +394,11 @@ void LightEffects::runSequenceManager() {
       modeStartMs = now;
       if (currentMode == MODE_TWINKLE) resetTwinkle();
       else if (currentMode == MODE_CHAIN) resetChain();
-      else if (currentMode == MODE_FADE) resetFade();
+      else if (currentMode == MODE_RANDOM) resetRandom();
     }
     if (currentMode == MODE_CHAIN) chainChristmasLights();
     else if (currentMode == MODE_TWINKLE) twinkleLights();
-    else if (currentMode == MODE_FADE) fadeLights();
+    else if (currentMode == MODE_RANDOM) randomLights();
   if ((now - modeStartMs) >= modeDurationMs) { modeInTransition = true; modeTransitionStart = now; }
   } else {
     unsigned long elapsed = now - modeTransitionStart;
@@ -327,8 +416,9 @@ void LightEffects::runSequenceManager() {
     if (elapsed >= (TRANSITION_FADE_MS + TRANSITION_HOLD_MS)) {
       noInterrupts(); for (int i=0;i<6;++i) christmasDuty[i]=0; interrupts();
       modeInTransition = false; modeStartMs = 0;
-      if (currentMode == MODE_CHAIN) currentMode = MODE_TWINKLE;
-      else if (currentMode == MODE_TWINKLE) currentMode = MODE_FADE;
+      // Cycle between chain, random, and twinkle effects
+      if (currentMode == MODE_CHAIN) currentMode = MODE_RANDOM;
+      else if (currentMode == MODE_RANDOM) currentMode = MODE_TWINKLE;
       else currentMode = MODE_CHAIN;
     } else if (elapsed >= TRANSITION_FADE_MS) {
       noInterrupts();
