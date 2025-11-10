@@ -52,6 +52,8 @@ LightEffects::LightEffects(const int pins[6]) {
     twinkle_active[i] = false;
     twinkle_startTs[i] = 0;
     twinkle_durMs[i] = 0;
+    twinkle_peakBrightness[i] = 255;
+    twinkle_cooldown[i] = 0;
   }
 }
 
@@ -229,6 +231,8 @@ void LightEffects::resetTwinkle() {
     twinkle_active[i] = false;
     twinkle_startTs[i] = 0;
     twinkle_durMs[i] = 0;
+    twinkle_peakBrightness[i] = 255;
+    twinkle_cooldown[i] = 0;
   }
   twinkle_nextEvalAt = 0;
 }
@@ -242,62 +246,85 @@ void LightEffects::twinkleLights() {
   const uint8_t START_CHANCE = 14;
 
   unsigned long now = millis();
-  if (twinkle_nextEvalAt == 0) { twinkle_nextEvalAt = now + rndRange(250,400); return; }
-  if (now < twinkle_nextEvalAt) return;
-  twinkle_nextEvalAt = now + rndRange(250,400);
+  
+  // Check if it's time to potentially start new lights
+  bool canStartNew = false;
+  if (twinkle_nextEvalAt == 0) { 
+    twinkle_nextEvalAt = now + rndRange(250,400); 
+  }
+  if (now >= twinkle_nextEvalAt) {
+    canStartNew = true;
+    twinkle_nextEvalAt = now + rndRange(250,400);
+  }
 
   uint8_t nextDuty[6];
   for (int i = 0; i < 6; ++i) nextDuty[i] = 0;
 
+  // Count active lights and set cooldown for finished ones
   int activeCount = 0;
   for (int i = 0; i < 6; ++i) {
     if (twinkle_active[i]) {
       unsigned long elapsed = now - twinkle_startTs[i];
-      if (elapsed >= TWINKLE_DUR_MS) twinkle_active[i] = false;
-      else activeCount++;
+      if (elapsed >= TWINKLE_DUR_MS) {
+        twinkle_active[i] = false;
+        twinkle_cooldown[i] = now + rndRange(500, 1500); // 0.5-1.5 second cooldown
+      } else {
+        activeCount++;
+      }
     }
   }
 
-  // Ensure at least one light is always active
+  // Ensure at least one light is always active (ignore cooldown for this)
   if (activeCount == 0) {
     int idx = random(0, 6);
     twinkle_active[idx] = true;
     twinkle_startTs[idx] = now;
     twinkle_durMs[idx] = TWINKLE_DUR_MS;
+    twinkle_peakBrightness[idx] = random(128, 256); // Random brightness 50%-100%
+    twinkle_cooldown[idx] = 0; // Clear cooldown since we need this light on
     activeCount = 1;
   }
 
-  for (int i = 0; i < 6; ++i) {
-    if (!twinkle_active[i]) {
-      if (activeCount < 3 && (random(0,100) < START_CHANCE)) {
-        twinkle_active[i] = true;
-        twinkle_startTs[i] = now;
-        twinkle_durMs[i] = TWINKLE_DUR_MS;
-        activeCount++;
-      }
-    } else {
-      if (random(0,100) < START_CHANCE) {
-        twinkle_startTs[i] = now;
-        twinkle_durMs[i] = TWINKLE_DUR_MS;
+  // Start new lights if it's time
+  if (canStartNew) {
+    for (int i = 0; i < 6; ++i) {
+      // Only start lights that are not currently active and past their cooldown
+      if (!twinkle_active[i] && now >= twinkle_cooldown[i]) {
+        if (activeCount < 3 && (random(0,100) < START_CHANCE)) {
+          twinkle_active[i] = true;
+          twinkle_startTs[i] = now;
+          twinkle_durMs[i] = TWINKLE_DUR_MS;
+          twinkle_peakBrightness[i] = random(128, 256); // Random brightness 50%-100%
+          activeCount++;
+        }
       }
     }
+  }
 
+  // Update all lights every frame for smooth fading
+  for (int i = 0; i < 6; ++i) {
     if (twinkle_active[i]) {
       unsigned long elapsed = now - twinkle_startTs[i];
-      if (elapsed >= TWINKLE_DUR_MS) { twinkle_active[i] = false; nextDuty[i] = 0; continue; }
+      if (elapsed >= TWINKLE_DUR_MS) { 
+        twinkle_active[i] = false; 
+        nextDuty[i] = 0; 
+        continue; 
+      }
       
-      // Match chain effect fade pattern: fade in -> hold -> fade out
+      // Calculate fade with random peak brightness
+      uint8_t peakBri = twinkle_peakBrightness[i];
       uint8_t bri = 0;
+      
       if (elapsed < FADE_IN_MS) {
         // Fade in phase
-        bri = (uint8_t)((elapsed * 255UL) / FADE_IN_MS);
+        bri = (uint8_t)((elapsed * (unsigned long)peakBri) / FADE_IN_MS);
       } else if (elapsed < (FADE_IN_MS + HOLD_MS)) {
-        // Hold phase
-        bri = 255;
+        // Hold phase at peak brightness
+        bri = peakBri;
       } else {
         // Fade out phase
         unsigned long fadeOutElapsed = elapsed - (FADE_IN_MS + HOLD_MS);
-        bri = (uint8_t)(255UL - ((fadeOutElapsed * 255UL) / FADE_OUT_MS));
+        bri = (uint8_t)((unsigned long)peakBri - ((fadeOutElapsed * (unsigned long)peakBri) / FADE_OUT_MS));
       }
       
       uint8_t scaled = scaleToIsr((uint8_t)constrain(bri, 0, 255));

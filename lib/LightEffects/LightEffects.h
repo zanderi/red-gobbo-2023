@@ -39,6 +39,8 @@ private:
   bool twinkle_active[6];
   unsigned long twinkle_startTs[6];
   unsigned long twinkle_durMs[6];
+  uint8_t twinkle_peakBrightness[6];
+  unsigned long twinkle_cooldown[6];
   unsigned long twinkle_nextEvalAt;
 
   // fade base
